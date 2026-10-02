@@ -10,7 +10,9 @@ services:
         value: production
       - key: DATA_DIR
         value: /var/data
-      - key: ADMIN_API_KEY
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: ADMIN_SETUP_TOKEN
         sync: false
     disk:
       name: dhl-gold-express-data
