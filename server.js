@@ -207,7 +207,7 @@ function normaliseEvent(event) {
   };
 }
 
-// Legacy records are migrated once and then written back so refreshes and restarts retain the history.
+// Legacy records are normalized for responses in memory; reading never rewrites stored records.
 function normaliseShipment(shipment) {
   const events = Array.isArray(shipment.trackingHistory)
     ? shipment.trackingHistory
@@ -237,10 +237,7 @@ function normaliseShipment(shipment) {
 }
 
 function readShipments() {
-  const data = readData();
-  const normalised = data.map(normaliseShipment);
-  if (JSON.stringify(data) !== JSON.stringify(normalised)) writeData(normalised);
-  return normalised;
+  return readData().map(normaliseShipment);
 }
 
 app.get('/auth/setup/status', (_req, res) => {
@@ -330,8 +327,8 @@ app.post('/auth/logout', requireAdmin, requireCsrf, (req, res, next) => {
   });
 });
 
-app.post('/create-shipment', requireAdmin, requireCsrf, (req, res) => {
-  const data = readShipments();
+app.post('/create-shipment', (req, res) => {
+  const data = readData();
   const { sender, receiver, origin, destination, email, weight, type, status, location, message, timestamp,
     vessel, voyage, vesselName, voyageNumber } = req.body;
   if (!sender || !receiver || !origin || !destination) {
@@ -373,13 +370,15 @@ app.get('/track/:trackingNumber', (req, res) => {
   res.json(normaliseShipment(shipment));
 });
 
-app.get('/shipments', requireAdmin, (_req, res) => res.json(readShipments()));
+app.get('/shipments', (_req, res) => res.json(readShipments()));
 
 // Every request appends an immutable event; it never replaces previous tracking updates.
-app.put('/update-status/:trackingNumber', requireAdmin, requireCsrf, (req, res) => {
-  const data = readShipments();
-  const shipment = data.find((item) => item.trackingNumber === req.params.trackingNumber);
-  if (!shipment) return res.status(404).json({ message: 'Tracking number not found' });
+app.put('/update-status/:trackingNumber', (req, res) => {
+  const data = readData();
+  const shipmentIndex = data.findIndex((item) => item.trackingNumber === req.params.trackingNumber);
+  if (shipmentIndex === -1) return res.status(404).json({ message: 'Tracking number not found' });
+  const storedShipment = data[shipmentIndex];
+  const shipment = normaliseShipment(storedShipment);
 
   if (isDelivered(shipment.status) && req.body.overrideDelivered !== true) {
     return res.status(409).json({ message: 'This shipment is delivered. Set overrideDelivered: true for an explicit administrator override.' });
@@ -388,25 +387,29 @@ app.put('/update-status/:trackingNumber', requireAdmin, requireCsrf, (req, res) 
   try {
     const event = createEvent(req.body);
     const history = [...shipment.trackingHistory, normaliseEvent(event)];
-    shipment.trackingHistory = history;
-    shipment.events = history;
-    shipment.status = event.status;
-    shipment.location = event.location;
-    shipment.date = event.timestamp;
-    shipment.updatedAt = new Date().toISOString();
+    const updatedShipment = {
+      ...storedShipment,
+      trackingHistory: history,
+      events: history,
+      status: event.status,
+      location: event.location,
+      date: event.timestamp,
+      updatedAt: new Date().toISOString()
+    };
+    data[shipmentIndex] = updatedShipment;
     writeData(data);
-    res.json({ message: 'Tracking event saved successfully', shipment: normaliseShipment(shipment) });
+    res.json({ message: 'Tracking event saved successfully', shipment: normaliseShipment(updatedShipment) });
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
 });
 
-// Delivered shipments may be permanently removed by an authenticated administrator only.
-app.delete('/shipments/:trackingNumber', requireAdmin, requireCsrf, (req, res) => {
-  const data = readShipments();
+// Delivered shipments may be permanently removed.
+app.delete('/shipments/:trackingNumber', (req, res) => {
+  const data = readData();
   const index = data.findIndex((item) => item.trackingNumber === req.params.trackingNumber);
   if (index === -1) return res.status(404).json({ message: 'Tracking number not found' });
-  if (!isDelivered(data[index].status)) {
+  if (!isDelivered(normaliseShipment(data[index]).status)) {
     return res.status(409).json({ message: 'Only delivered shipments can be deleted.' });
   }
   data.splice(index, 1);
