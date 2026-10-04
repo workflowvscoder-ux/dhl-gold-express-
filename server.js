@@ -11,7 +11,12 @@ const { rateLimit } = require('express-rate-limit');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || __dirname;
+const configuredDataDir = typeof process.env.DATA_DIR === 'string' ? process.env.DATA_DIR.trim() : '';
+if (process.env.NODE_ENV === 'production'
+  && (!configuredDataDir || !path.isAbsolute(configuredDataDir))) {
+  throw new Error('DATA_DIR must be configured as an absolute persistent path in production.');
+}
+const DATA_DIR = path.resolve(configuredDataDir || __dirname);
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 const ADMIN_FILE = path.join(DATA_DIR, 'admin.json');
 const SESSION_DIR = path.join(DATA_DIR, 'admin-sessions');
@@ -34,9 +39,44 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10kb' }));
 
+function atomicWriteFile(filePath, contents) {
+  const directory = path.dirname(filePath);
+  const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  let fileDescriptor;
+
+  try {
+    fileDescriptor = fs.openSync(temporaryPath, 'wx', 0o600);
+    fs.writeFileSync(fileDescriptor, contents, 'utf8');
+    fs.fsyncSync(fileDescriptor);
+    fs.closeSync(fileDescriptor);
+    fileDescriptor = undefined;
+    fs.renameSync(temporaryPath, filePath);
+    if (process.platform !== 'win32') {
+      const directoryDescriptor = fs.openSync(directory, 'r');
+      try {
+        fs.fsyncSync(directoryDescriptor);
+      } finally {
+        fs.closeSync(directoryDescriptor);
+      }
+    }
+  } catch (error) {
+    if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch (_cleanupError) {
+      // Preserve the original write error.
+    }
+    throw error;
+  }
+}
+
 function ensureFile(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+  try {
+    fs.writeFileSync(filePath, JSON.stringify([], null, 2), { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
 }
 
 ensureFile(DATA_FILE);
@@ -149,11 +189,12 @@ function regenerateAdminSession(req, username) {
 
 function readData() {
   const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  return Array.isArray(parsed) ? parsed : [];
+  if (!Array.isArray(parsed)) throw new Error('Shipment data file must contain a JSON array.');
+  return parsed;
 }
 
 function writeData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  atomicWriteFile(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
 function generateTracking() {
@@ -335,8 +376,9 @@ app.post('/create-shipment', (req, res) => {
     return res.status(400).json({ message: 'Missing required shipment fields' });
   }
 
+  let initialEvent;
   try {
-    const initialEvent = createEvent({
+    initialEvent = createEvent({
       status: status || 'Shipment label created',
       location: location || origin,
       message: message || 'Shipment registered and awaiting origin processing.',
@@ -357,7 +399,12 @@ app.post('/create-shipment', (req, res) => {
       events: [initialEvent]
     };
     data.push(shipment);
-    writeData(data);
+    try {
+      writeData(data);
+    } catch (error) {
+      console.error('Unable to persist new shipment:', error);
+      return res.status(500).json({ message: 'Unable to persist shipment data.' });
+    }
     res.status(201).json({ message: 'Shipment created', trackingNumber: shipment.trackingNumber, shipment: normaliseShipment(shipment) });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -370,10 +417,10 @@ app.get('/track/:trackingNumber', (req, res) => {
   res.json(normaliseShipment(shipment));
 });
 
-app.get('/shipments', (_req, res) => res.json(readShipments()));
+app.get('/shipments', requireAdmin, (_req, res) => res.json(readShipments()));
 
 // Every request appends an immutable event; it never replaces previous tracking updates.
-app.put('/update-status/:trackingNumber', (req, res) => {
+app.put('/update-status/:trackingNumber', requireAdmin, requireCsrf, (req, res) => {
   const data = readData();
   const shipmentIndex = data.findIndex((item) => item.trackingNumber === req.params.trackingNumber);
   if (shipmentIndex === -1) return res.status(404).json({ message: 'Tracking number not found' });
@@ -384,28 +431,35 @@ app.put('/update-status/:trackingNumber', (req, res) => {
     return res.status(409).json({ message: 'This shipment is delivered. Set overrideDelivered: true for an explicit administrator override.' });
   }
 
+  let event;
   try {
-    const event = createEvent(req.body);
-    const history = [...shipment.trackingHistory, normaliseEvent(event)];
-    const updatedShipment = {
-      ...storedShipment,
-      trackingHistory: history,
-      events: history,
-      status: event.status,
-      location: event.location,
-      date: event.timestamp,
-      updatedAt: new Date().toISOString()
-    };
-    data[shipmentIndex] = updatedShipment;
-    writeData(data);
-    res.json({ message: 'Tracking event saved successfully', shipment: normaliseShipment(updatedShipment) });
+    event = createEvent(req.body);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    return res.status(400).json({ message: error.message });
   }
+
+  const history = [...shipment.trackingHistory, normaliseEvent(event)];
+  const updatedShipment = {
+    ...storedShipment,
+    trackingHistory: history,
+    events: history,
+    status: event.status,
+    location: event.location,
+    date: event.timestamp,
+    updatedAt: new Date().toISOString()
+  };
+  data[shipmentIndex] = updatedShipment;
+  try {
+    writeData(data);
+  } catch (error) {
+    console.error('Unable to persist shipment update:', error);
+    return res.status(500).json({ message: 'Unable to persist shipment data.' });
+  }
+  res.json({ message: 'Tracking event saved successfully', shipment: normaliseShipment(updatedShipment) });
 });
 
 // Delivered shipments may be permanently removed.
-app.delete('/shipments/:trackingNumber', (req, res) => {
+app.delete('/shipments/:trackingNumber', requireAdmin, requireCsrf, (req, res) => {
   const data = readData();
   const index = data.findIndex((item) => item.trackingNumber === req.params.trackingNumber);
   if (index === -1) return res.status(404).json({ message: 'Tracking number not found' });
@@ -419,5 +473,11 @@ app.delete('/shipments/:trackingNumber', (req, res) => {
 
 app.get('/', (_req, res) => res.send('DHL Gold Express backend is running'));
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'dhl-gold-express-backend' }));
+
+app.use((error, _req, res, next) => {
+  console.error('Unhandled request error:', error);
+  if (res.headersSent) return next(error);
+  res.status(500).json({ message: 'Internal server error.' });
+});
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
