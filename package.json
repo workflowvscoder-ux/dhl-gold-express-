@@ -6,17 +6,19 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "migrate:file": "node migrate-file-data.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "express-rate-limit": "^8.7.0",
-    "express-session": "^1.19.0",
-    "session-file-store": "^1.5.0"
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
   }
 }

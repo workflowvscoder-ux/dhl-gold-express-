@@ -2,19 +2,13 @@ services:
   - type: web
     name: dhl-gold-express-backend
     runtime: node
-    plan: starter
-    buildCommand: npm install
+    plan: free
+    buildCommand: npm ci
     startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATA_DIR
-        value: /var/data
+      - key: DATABASE_URL
+        sync: false
       - key: FRONTEND_ORIGIN
         sync: false
-      - key: ADMIN_SETUP_TOKEN
-        sync: false
-    disk:
-      name: dhl-gold-express-data
-      mountPath: /var/data
-      sizeGB: 1

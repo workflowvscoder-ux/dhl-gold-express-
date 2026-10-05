@@ -1,50 +1,64 @@
 # DHL GOLD Express Backend
 
-Node.js 18+ and Express API. Shipment creation and tracking are public. Shipment listing and all shipment administration require the existing administrator session; status updates and deletion also require a CSRF token.
+Node.js 18+ and Express API. PostgreSQL is the production source of truth for shipment records and history. The browser communicates only with this API; `DATABASE_URL` remains backend-only.
 
-## Public Routes
+## Access model
 
-These routes do not require an administrator session:
+The Admin Dashboard does not require authentication. It is intentionally accessible without a login. There is no login, logout, session, cookie authentication, or CSRF token flow.
+
+The Dashboard is the only shipment-management interface; no separate database-admin dashboard is required. Its management API routes are also intentionally unauthenticated. Anyone who can reach the API can list shipments, see shipment names/routes/status/history, update shipments, and archive delivered shipments. The Admin Dashboard is therefore not private, and CORS is not an access-control boundary. Do not treat HTTPS or the frontend origin allowlist as authentication.
+
+## Routes
 
 - `GET /`
 - `GET /health`
-- `GET /track/:trackingNumber`
-- `POST /create-shipment`
+- `POST /create-shipment` — public, limited to 10 requests per 15 minutes per client IP.
+- `GET /track/:trackingNumber` — public, limited to 120 requests per 15 minutes per client IP. Returns tracking information and history without customer email or internal database fields.
+- `GET /shipments` — unauthenticated Admin Dashboard listing; customer email and internal fields are omitted.
+- `PUT /update-status/:trackingNumber` — unauthenticated status/location update; appends a history event.
+- `DELETE /shipments/:trackingNumber` — unauthenticated archive action; archives delivered shipments without deleting shipment or history records.
 
-## Administrator Routes
+The public rate limits use the existing in-process rate limiter and return HTTP 429 when exceeded. The management routes have no authentication by owner requirement.
 
-- `GET /shipments`
-- `PUT /update-status/:trackingNumber`
-- `DELETE /shipments/:trackingNumber` (only delivered shipments)
+## Storage architecture
 
-All administrator routes require a logged-in administrator session. `PUT /update-status/:trackingNumber` and `DELETE /shipments/:trackingNumber` additionally require the session's CSRF token in the `X-CSRF-Token` header. Deletion is limited to delivered shipments.
+Production storage is PostgreSQL reached only by the Express backend through the server-side `DATABASE_URL`. The frontend must never receive the database URL or connect directly to PostgreSQL. PGlite is used only by automated tests.
 
-## Administrator Authentication
+Startup initializes the shipment tables and history index. It does not create authentication tables or require administrator credentials. If legacy `admin_users`, `admin_sessions`, or `app_settings` tables already exist in a database, the application no longer reads or writes them and does not drop them.
 
-- `GET /auth/setup/status`
-- `POST /auth/setup`
-- `POST /auth/login`
-- `GET /auth/me`
-- `POST /auth/logout`
+- `shipments` stores the tracking number, shipment/customer fields, status/location, timestamps, archive marker, and preserved legacy fields.
+- `shipment_history` stores every creation and update event, including status, location, message, event type, actor label, time, vessel/voyage, and preserved legacy event fields. A restrictive foreign key prevents shipment deletion from cascading to history.
 
-The first administrator account is created through `/auth/setup` using the configured one-time `ADMIN_SETUP_TOKEN`. Keep that token secret. The dashboard signs in through `/auth/login`, uses the resulting session cookie, and sends the CSRF token on state-changing administrator requests.
+Shipment creation and each status/location update write shipment state and its history event transactionally. History is returned in chronological order. Archiving marks a delivered shipment and retains its record/history; archived shipments remain in the dashboard list and are no longer publicly trackable or editable.
 
-## Frontend And CORS
+## Legacy JSON import
 
-The static frontend uses `https://dhl-gold-express.onrender.com` as its API base URL. Configure `FRONTEND_ORIGIN` in Render to the exact website origin, for example `https://<distribution-id>.cloudfront.net`, with no trailing slash. The backend enables credentialed CORS for this origin so the administrator session cookie can be used. CORS is not a substitute for session or CSRF authorization.
+There is no automatic production import. Back up and review the source JSON first, then set `DATABASE_URL` to the intended destination and run:
 
-Public tracking clients should call `GET /track/:trackingNumber`; do not retrieve the full shipment list just to track one shipment.
+```sh
+npm run migrate:file -- "path/to/data.json"
+```
 
-## Storage
+The shipment import is transactional and idempotent by tracking number. Existing records are skipped, never replaced. It imports shipment data only; administrator-account files are no longer used. Never run a migration with a production URL unless intentionally performing an approved migration.
 
-Render sets `DATA_DIR=/var/data` and mounts the existing persistent disk there. Shipment records remain in `data.json`; do not detach or replace that disk. The server also stores the administrator account, sessions, and session secret in the same directory. Shipment data writes use atomic file replacement; successful create/update/delete responses are sent only after the write completes. No frontend deployment step changes or migrates storage.
+## Environment variables
 
-## Local Checks
+- `DATABASE_URL` (required): PostgreSQL connection URL, kept only in the backend/Render environment.
+- `FRONTEND_ORIGIN` (required in production for browser API access): exact public frontend origin, including scheme but no path or trailing slash. This configures CORS only; it does not restrict non-browser clients or authenticate management requests.
+- `NODE_ENV=production` (Render): enables production configuration validation.
+- `PORT` (optional): supplied by Render in production.
+
+There is no requirement for `DATA_DIR`, `ADMIN_SETUP_TOKEN`, admin passwords, session secrets, or a persistent Render disk. Startup fails if `DATABASE_URL` is missing or invalid; production shipment persistence is PostgreSQL.
+
+## Local development and deployment
+
+Automated integration tests use PGlite in a temporary OS directory and do not use Neon, a production API, or an external database:
 
 ```sh
 npm ci
 npm test
-npm start
 ```
 
-The integration test uses a temporary data directory and does not alter the configured shipment store.
+For manual development, provide a disposable PostgreSQL-compatible `DATABASE_URL` and a local `FRONTEND_ORIGIN`, then run `npm start`. Render should provide `PORT` and configure `DATABASE_URL`, `FRONTEND_ORIGIN`, and `NODE_ENV=production`. Do not deploy until PostgreSQL is configured in the backend environment.
+
+Serve the Admin Dashboard from a real HTTPS frontend origin before final production verification. HTTPS protects data in transit but does not make the unauthenticated dashboard private or prevent unauthorized management operations.
