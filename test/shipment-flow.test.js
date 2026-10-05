@@ -93,9 +93,14 @@ test('source and deployment frontend copies remain synchronized', async () => {
   }
   const adminDashboard = await fs.readFile(path.join(frontendRoot, 'admin.html'), 'utf8');
   const sharedBrowserHelpers = await fs.readFile(path.join(frontendRoot, 'js', 'app.js'), 'utf8');
+  const customerShipmentForm = await fs.readFile(path.join(frontendRoot, 'ship.html'), 'utf8');
+  const trackingPage = await fs.readFile(path.join(frontendRoot, 'track.html'), 'utf8');
   assert.match(adminDashboard, /<main id="dashboard" class="container section">/);
   assert.doesNotMatch(adminDashboard, /adminLogin|adminLogout|\/auth\/(login|me|logout)|Sign In/);
   assert.doesNotMatch(sharedBrowserHelpers, /adminCsrfToken|setAdminCsrfToken|X-CSRF-Token/);
+  assert.match(customerShipmentForm, /id="receiver" name="receiver"/);
+  assert.match(customerShipmentForm, /JSON\.stringify\(\{ sender, receiver, origin, destination, email, weight, type \}\)/);
+  assert.match(trackingPage, /const receiver = data\.receiver \|\| 'Receiver not available'/);
 });
 
 test('PostgreSQL shipment flow preserves history and data across backend restart', { timeout: 120000 }, async () => {
@@ -192,7 +197,7 @@ test('PostgreSQL shipment flow preserves history and data across backend restart
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       sender: 'E2E Sender',
-      receiver: 'E2E Receiver',
+      receiver: 'Test Receiver Debug 2026',
       origin: 'E2E Origin',
       destination: 'E2E Destination',
       email: 'e2e@example.invalid',
@@ -202,6 +207,7 @@ test('PostgreSQL shipment flow preserves history and data across backend restart
   });
   assert.equal(created.status, 201);
   assert.equal(Object.hasOwn(created.body.shipment, 'email'), false);
+  assert.equal(created.body.shipment.receiver, 'Test Receiver Debug 2026');
   const trackingNumber = created.body.trackingNumber;
   assert.match(trackingNumber, /^DHLG\d{12}$/);
   assert.equal(created.body.shipment.trackingNumber, trackingNumber);
@@ -215,6 +221,7 @@ test('PostgreSQL shipment flow preserves history and data across backend restart
   assert.equal(publicCreatedTracking.status, 200);
   assert.equal(Object.hasOwn(publicCreatedTracking.body, 'email'), false);
   assert.equal(publicCreatedTracking.body.trackingNumber, trackingNumber);
+  assert.equal(publicCreatedTracking.body.receiver, 'Test Receiver Debug 2026');
   assert.equal(publicCreatedTracking.body.origin, 'E2E Origin');
   assert.equal(publicCreatedTracking.body.destination, 'E2E Destination');
   assert.equal(publicCreatedTracking.body.status, 'Shipment Created');
@@ -229,6 +236,7 @@ test('PostgreSQL shipment flow preserves history and data across backend restart
   const shipmentFromDashboard = shipments.body.find((shipment) => shipment.trackingNumber === trackingNumber);
   assert.ok(shipmentFromDashboard);
   assert.equal(shipmentFromDashboard.sender, 'E2E Sender');
+  assert.equal(shipmentFromDashboard.receiver, 'Test Receiver Debug 2026');
   assert.equal(Object.hasOwn(shipmentFromDashboard, 'email'), false);
   const migratedAdminShipment = shipments.body.find((shipment) => shipment.trackingNumber === legacyTrackingNumber);
   assert.ok(migratedAdminShipment);
@@ -262,6 +270,7 @@ test('PostgreSQL shipment flow preserves history and data across backend restart
   const pickupTracking = await request(`/track/${trackingNumber}`);
   assert.equal(pickupTracking.status, 200);
   assert.equal(pickupTracking.body.status, 'Picked Up');
+  assert.equal(pickupTracking.body.receiver, 'Test Receiver Debug 2026');
   assert.equal(pickupTracking.body.location, 'E2E Pickup Location');
   assert.equal(pickupTracking.body.trackingHistory.length, 2);
 
@@ -308,6 +317,7 @@ test('PostgreSQL shipment flow preserves history and data across backend restart
   const trackingAfterRestart = await request(`/track/${trackingNumber}`);
   assert.equal(trackingAfterRestart.status, 200);
   assert.equal(trackingAfterRestart.body.status, 'Delivered');
+  assert.equal(trackingAfterRestart.body.receiver, 'Test Receiver Debug 2026');
   assert.equal(trackingAfterRestart.body.trackingHistory.length, 4);
   assert.equal(trackingAfterRestart.body.trackingHistory[0].status, 'Shipment Created');
   assert.deepEqual(

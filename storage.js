@@ -225,6 +225,7 @@ function toPublicTrackingResponse(shipment) {
   }));
   return {
     trackingNumber: shipment.trackingNumber,
+    receiver: shipment.receiver,
     origin: shipment.origin,
     destination: shipment.destination,
     type: shipment.type,
